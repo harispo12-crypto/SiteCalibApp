@@ -2,6 +2,9 @@ import io
 import json
 import math
 import os
+import gspread 
+from google.oauth2.service_account 
+import Credentials
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -539,13 +542,32 @@ if st.session_state.calibrated:
     st.dataframe(display_res_df, use_container_width=True)
 
 # =========================================================
-# 💾 ระบบบันทึกและโหลดข้อมูลถาวร (Enhanced Storage Engine)
+# ☁️ ระบบเชื่อมต่อและจัดการข้อมูลผ่าน Google Sheets API
 # =========================================================
-DATA_FILE_PATH = "saved_map_points.json"
+
+
+@st.cache_resource
+def get_gsheet_client():
+    """สร้าง Client สำหรับเชื่อมต่อ Google Sheets API ผ่าน st.secrets"""
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    if "gcp_service_account" not in st.secrets:
+        st.error(
+            "❌ ไม่พบข้อมูล 'gcp_service_account' ใน .streamlit/secrets.toml"
+        )
+        st.stop()
+
+    creds_dict = st.secrets["gcp_service_account"]
+    credentials = Credentials.from_service_account_info(
+        creds_dict, scopes=scopes
+    )
+    return gspread.authorize(credentials)
 
 
 def safe_clean_dataframe(df):
-    """ทำความสะอาดและแปลงชนิดข้อมูลให้ปลอดภัยสำหรับ JSON/Database"""
+    """ทำความสะอาดและแปลงชนิดข้อมูลให้ปลอดภัยสำหรับ Google Sheets/Dataframe"""
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -576,38 +598,62 @@ def safe_clean_dataframe(df):
             if dtype == str:
                 clean_df[col] = clean_df[col].fillna("").astype(str)
             elif dtype == bool:
-                clean_df[col] = clean_df[col].astype(bool)
+                # รองรับค่า True/False จาก Google Sheets ทั้ง boolean และ string
+                clean_df[col] = (
+                    clean_df[col]
+                    .astype(str)
+                    .str.upper()
+                    .isin(["TRUE", "1", "YES"])
+                )
             elif dtype == float:
                 clean_df[col] = pd.to_numeric(clean_df[col], errors="coerce")
 
     return clean_df
 
 
-def save_points_to_disk(df):
-    """บันทึก DataFrame ลงไฟล์ดิสก์อย่างปลอดภัยด้วย Native JSON Handling"""
+def load_points_from_gsheets():
+    """โหลด DataFrame จาก Google Sheets"""
     try:
+        gc = get_gsheet_client()
+        spreadsheet_url = st.secrets["gsheets"]["spreadsheet_url"]
+        sh = gc.open_by_url(spreadsheet_url)
+        worksheet = sh.get_worksheet(0)  # แผ่นงานแรก
+
+        data = worksheet.get_all_records()
+        if not data:
+            return None
+        df = pd.DataFrame(data)
+        return safe_clean_dataframe(df)
+    except Exception as e:
+        st.error(f"เกิดข้อผิดพลาดในการโหลดข้อมูลจาก Google Sheets: {e}")
+        return None
+
+
+def save_points_to_gsheets(df):
+    """บันทึก DataFrame ลง Google Sheets แบบเขียนทับทั้งหมด (Sync)"""
+    try:
+        gc = get_gsheet_client()
+        spreadsheet_url = st.secrets["gsheets"]["spreadsheet_url"]
+        sh = gc.open_by_url(spreadsheet_url)
+        worksheet = sh.get_worksheet(0)
+
         clean_df = safe_clean_dataframe(df)
-        records = clean_df.to_dict(orient="records")
-        with open(DATA_FILE_PATH, "w", encoding="utf-8") as f:
-            json.dump(records, f, ensure_ascii=False, indent=2)
+
+        # แทนค่า NaN / None ด้วยค่าว่างก่อนส่งเข้า Google Sheets
+        clean_df_prepared = clean_df.fillna("")
+
+        # เตรียมข้อมูล Header และ Values
+        header = clean_df_prepared.columns.tolist()
+        values = clean_df_prepared.values.tolist()
+        data_to_update = [header] + values
+
+        # ล้างข้อมูลเดิมและเขียนข้อมูลใหม่
+        worksheet.clear()
+        worksheet.update(data_to_update)
         return True
     except Exception as e:
-        st.error(f"เกิดข้อผิดพลาดในการบันทึกไฟล์: {e}")
+        st.error(f"เกิดข้อผิดพลาดในการบันทึกข้อมูลลง Google Sheets: {e}")
         return False
-
-
-def load_points_from_disk():
-    """โหลด DataFrame จากไฟล์ดิสก์ถ้ามี"""
-    if os.path.exists(DATA_FILE_PATH):
-        try:
-            with open(DATA_FILE_PATH, "r", encoding="utf-8") as f:
-                records = json.load(f)
-            df = pd.DataFrame(records)
-            return safe_clean_dataframe(df)
-        except Exception as e:
-            st.error(f"เกิดข้อผิดพลาดในการโหลดไฟล์: {e}")
-            return None
-    return None
 
 
 # =========================================================
@@ -625,13 +671,13 @@ st.caption(
     " ได้ตลอดเวลาในภายหลัง**"
 )
 
-# โหลดข้อมูลถาวรจากดิสก์หากยังไม่มีใน Session State
+# โหลดข้อมูลถาวรจาก Google Sheets หากยังไม่มีใน Session State
 if "map_pts_df" not in st.session_state:
-    saved_df = load_points_from_disk()
+    saved_df = load_points_from_gsheets()
     if saved_df is not None and not saved_df.empty:
         st.session_state.map_pts_df = saved_df
     else:
-        # Default Data
+        # Default Data กรณีเริ่มต้น หรือ Sheet ว่างเปล่า
         default_df = pd.DataFrame([
             {
                 "Show": True,
@@ -680,18 +726,26 @@ map_editor_df = st.data_editor(
 # อัปเดตข้อมูลใน Session State อัตโนมัติ
 st.session_state.map_pts_df = safe_clean_dataframe(map_editor_df)
 
-# 2. ระบบควบคุมความปลอดภัยข้อมูล (Save/Load/Backup Storage Hub)
-with st.expander("💾 ระบบจัดการฐานข้อมูลและไฟล์สำรอง (Data Backup & Storage Hub)", expanded=True):
+# 2. ระบบควบคุมความปลอดภัยข้อมูล (Cloud Storage & Backup Hub)
+with st.expander(
+    "☁️ ระบบจัดการฐานข้อมูล Cloud (Google Sheets & Backup Hub)", expanded=True
+):
     btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
 
     with btn_col1:
-        if st.button("💾 บันทึกลงดิสก์ (Save Server)", type="primary", use_container_width=True):
-            if save_points_to_disk(st.session_state.map_pts_df):
-                st.success("✅ บันทึกข้อมูลเรียบร้อยแล้ว!")
+        if st.button(
+            "☁️ บันทึกลง Google Sheets", type="primary", use_container_width=True
+        ):
+            if save_points_to_gsheets(st.session_state.map_pts_df):
+                st.success("✅ บันทึกข้อมูลลง Google Sheets เรียบร้อยแล้ว!")
 
     with btn_col2:
-        if st.button("🔄 ดึงข้อมูลล่าสุด (Reload)", type="secondary", use_container_width=True):
-            reloaded = load_points_from_disk()
+        if st.button(
+            "🔄 ดึงข้อมูลล่าสุด (Reload Cloud)",
+            type="secondary",
+            use_container_width=True,
+        ):
+            reloaded = load_points_from_gsheets()
             if reloaded is not None:
                 st.session_state.map_pts_df = reloaded
                 st.rerun()
@@ -713,7 +767,9 @@ with st.expander("💾 ระบบจัดการฐานข้อมูล
 
     with btn_col4:
         # Export CSV Backup
-        csv_buffer = st.session_state.map_pts_df.to_csv(index=False).encode('utf-8-sig')
+        csv_buffer = st.session_state.map_pts_df.to_csv(index=False).encode(
+            "utf-8-sig"
+        )
         st.download_button(
             label="📊 ส่งออกตาราง (.CSV)",
             data=csv_buffer,
@@ -722,9 +778,9 @@ with st.expander("💾 ระบบจัดการฐานข้อมูล
             use_container_width=True,
         )
 
-    # Option: Upload External Backup JSON
+    # Option: Upload External Backup JSON / CSV
     uploaded_backup = st.file_uploader(
-        "📥 นำเข้าไฟล์สำรอง (.JSON / .CSV) เพื่อกู้คืนพิกัดหมุด:",
+        "📥 นำเข้าไฟล์สำรอง (.JSON / .CSV) เพื่อกู้คืนพิกัดหมุดขึ้น Google Sheets:",
         type=["json", "csv"],
         key="backup_uploader",
     )
@@ -738,9 +794,13 @@ with st.expander("💾 ระบบจัดการฐานข้อมูล
 
             clean_imported = safe_clean_dataframe(imported_df)
             st.session_state.map_pts_df = clean_imported
-            save_points_to_disk(clean_imported)
-            st.success("✅ นำเข้าและบันทึกข้อมูลเรียบร้อยแล้ว!")
-            st.rerun()
+
+            # ซิงค์ลง Google Sheets ทันทีที่นำเข้า
+            if save_points_to_gsheets(clean_imported):
+                st.success(
+                    "✅ นำเข้าและบันทึกข้อมูลลง Google Sheets เรียบร้อยแล้ว!"
+                )
+                st.rerun()
         except Exception as ex:
             st.error(f"❌ ไม่สามารถนำเข้าไฟล์ได้: {ex}")
 
@@ -770,7 +830,7 @@ if "Show" in st.session_state.map_pts_df.columns:
 
     for _, row in active_map_pts.iterrows():
         try:
-            # แปลงพิกัดจาก Indian 1975 เป็น WGS84 Lat/Lon
+            # แปลงพิกัดจาก Indian 1975 เป็น WGS84 Lat/Lon (ใช้ฟังก์ชันเดิมของคุณ)
             lat_wgs, lon_wgs = indian1975_to_wgs84_latlon(
                 row["UTM_E"], row["UTM_N"], zone_number=zone_num
             )
